@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Antex XM-100 Control Panel</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 20px; }
+    button { margin: 5px; padding: 10px; }
+    input[type="number"] { width: 60px; padding: 5px; }
+    #container { display: flex; gap: 20px; }
+    #controls { width: 300px; }
+    #status-terminal { display: flex; gap: 20px; margin-bottom: 20px; }
+    #status {
+      width: 400px;
+      border: 1px solid #888;
+      padding: 10px;
+      border-radius: 6px;
+      background-color: #f0f0f0;
+    }
+    #output {
+      width: 600px;
+      height: 300px;
+      overflow: auto;
+      background: #111;
+      color: #0f0;
+      padding: 10px;
+      white-space: pre-wrap;
+      font-family: monospace;
+      border-radius: 6px;
+    }
+    .section { margin-top: 20px; }
+    table { border-collapse: collapse; width: 100%; }
+    td, th { border: 1px solid #888; padding: 5px; text-align: left; }
+    th { background-color: #ddd; }
+    .unknown { color: grey; }
+  </style>
+</head>
+<body>
+  <h1>Antex XM-100 Control Panel</h1>
+
+  <div id="status-terminal">
+    <div id="status">
+      <h2>Current Channel Status</h2>
+      <table>
+        <tr><th>Channel</th><td id="statusChannel">-</td></tr>
+        <tr><th>Category</th><td id="statusCategory">-</td></tr>
+        <tr><th>Channel Name</th><td id="statusName">-</td></tr>
+        <tr><th>Artist</th><td id="statusArtist">-</td></tr>
+        <tr><th>Song</th><td id="statusSong">-</td></tr>
+      </table>
+    </div>
+
+    <pre id="output">Terminal output will appear here...</pre>
+  </div>
+
+  <div id="controls">
+    <button id="connect">Connect</button>
+    <button id="disconnect" disabled>Disconnect</button>
+
+    <div class="section">
+      <h2>Power & Mute</h2>
+      <button id="powerToggle" class="unknown">Power Unknown</button>
+      <br>
+      <button class="cmd" data-cmd="*MU1">Mute On</button>
+      <button class="cmd" data-cmd="*MU0">Mute Off</button>
+    </div>
+
+    <div class="section">
+      <h2>Channel / Preset</h2>
+      <label>Channel: <input type="number" id="channel" min="1" max="999"></label>
+      <button id="setChannel">Change Channel</button>
+      <br>
+      <label>Preset #: <input type="number" id="presetRecall" min="1" max="9"></label>
+      <button id="recallPreset">Recall Preset</button>
+      <br>
+      <label>Store Preset #: <input type="number" id="presetStore" min="1" max="9"></label>
+      <label>Channel: <input type="number" id="storeChannel" min="1" max="999"></label>
+      <button id="storePreset">Store Preset</button>
+    </div>
+
+    <div class="section">
+      <h2>Navigation</h2>
+      <button class="cmd" data-cmd="*CU1">Channel Up</button>
+      <button class="cmd" data-cmd="*CD1">Channel Down</button>
+      <br>
+      <button class="cmd" data-cmd="*CGU1">Category Up</button>
+      <button class="cmd" data-cmd="*CGD1">Category Down</button>
+    </div>
+  </div>
+
+  <script>
+    let port, reader, writer;
+    let keepReading = false;
+    let buffer = "";
+    let powerState = null;
+
+    async function connect() {
+      try {
+        port = await navigator.serial.requestPort();
+        await port.open({ baudRate: 9600, dataBits: 8, stopBits: 1, parity: "none" });
+        writer = port.writable.getWriter();
+        reader = port.readable.getReader();
+        keepReading = true;
+        document.getElementById("disconnect").disabled = false;
+        document.getElementById("connect").disabled = true;
+        readLoop();
+        log("Connected to XM-100");
+
+        // Initial full status poll
+        sendCommand("*UN1");
+        setTimeout(() => {
+          sendCommand("*PR"); // Poll power after device responds
+        }, 1000);
+      } catch (err) {
+        log("Error: " + err);
+      }
+    }
+
+    async function disconnect() {
+      keepReading = false;
+      if (reader) { await reader.cancel(); reader.releaseLock(); }
+      if (writer) { writer.releaseLock(); }
+      if (port) { await port.close(); }
+      document.getElementById("connect").disabled = false;
+      document.getElementById("disconnect").disabled = true;
+      log("Disconnected");
+      powerState = null;
+      updatePowerButton();
+    }
+
+    async function readLoop() {
+      const decoder = new TextDecoder();
+      while (keepReading && port.readable) {
+        try {
+          const { value, done } = await reader.read();
+          if (done) break;
+          if (value) {
+            buffer += decoder.decode(value);
+            let idx;
+            while ((idx = buffer.indexOf('\r')) >= 0) {
+              let line = buffer.slice(0, idx);
+              buffer = buffer.slice(idx + 1);
+              line = line.trim();
+              if (!line) continue;
+              log("Received: " + line);
+              parseFeedback(line);
+            }
+          }
+        } catch (err) {
+          log("Read error: " + err);
+          break;
+        }
+      }
+    }
+
+    function parseFeedback(line) {
+      if (!line.startsWith("*")) return;
+      let content = line.substring(1); // remove leading *
+
+      // Power feedback
+      if (content.startsWith("PR1")) {
+        powerState = true;
+        updatePowerButton();
+        return;
+      } else if (content.startsWith("PR0")) {
+        powerState = false;
+        updatePowerButton();
+        return;
+      }
+
+      // Determine command field dynamically up to first comma
+      const firstComma = content.indexOf(",");
+      if (firstComma < 0) return; // invalid line
+      const cmd = content.slice(0, firstComma);
+      let rest = content.slice(firstComma + 1);
+
+      // Only parse if it is a status command
+      const statusCommands = ["UN1","CU1","CD1","CH1","PS1","CGU1","CGD1"];
+      if (!statusCommands.includes(cmd)) return;
+
+      try {
+        // Channel: 3 digits
+        let channel = rest.slice(0,3).trim();
+        rest = rest.slice(4); // skip 3 digits + comma
+
+        // Category: 8 chars
+        let category = rest.slice(0,8).trim();
+        rest = rest.slice(9); // skip 8 chars + comma
+
+        // Channel Name: 8 chars
+        let name = rest.slice(0,8).trim();
+        rest = rest.slice(9); // skip 8 chars + comma
+
+        // Artist: 16 chars
+        let artist = rest.slice(0,16).trim();
+        rest = rest.slice(17); // skip 16 chars + comma
+
+        // Song: 16 chars
+        let song = rest.slice(0,16).trim();
+
+        document.getElementById("statusChannel").textContent = channel;
+        document.getElementById("statusCategory").textContent = category;
+        document.getElementById("statusName").textContent = name;
+        document.getElementById("statusArtist").textContent = artist;
+        document.getElementById("statusSong").textContent = song;
+      } catch (err) {
+        console.warn("Failed to parse line:", line, err);
+      }
+    }
+
+    async function sendCommand(cmd) {
+      if (!writer) { log("Not connected"); return; }
+      await writer.write(new TextEncoder().encode(cmd + "\r"));
+      log("Sent: " + cmd);
+    }
+
+    function updatePowerButton() {
+      const btn = document.getElementById("powerToggle");
+      if (powerState === true) {
+        btn.textContent = "Power On";
+        btn.classList.remove("unknown");
+      } else if (powerState === false) {
+        btn.textContent = "Power Off";
+        btn.classList.remove("unknown");
+      } else {
+        btn.textContent = "Power Unknown";
+        btn.classList.add("unknown");
+      }
+    }
+
+    document.getElementById("connect").addEventListener("click", connect);
+    document.getElementById("disconnect").addEventListener("click", disconnect);
+
+    document.getElementById("powerToggle").addEventListener("click", () => {
+      if (powerState === true) {
+        sendCommand("*PR0");
+      } else {
+        sendCommand("*PR1");
+      }
+      powerState = null;
+      updatePowerButton();
+    });
+
+    document.querySelectorAll(".cmd").forEach(btn => {
+      btn.addEventListener("click", () => sendCommand(btn.getAttribute("data-cmd")));
+    });
+
+    document.getElementById("setChannel").addEventListener("click", () => {
+      const ch = document.getElementById("channel").value.padStart(3, '0');
+      sendCommand(`*CH1,${ch}`);
+    });
+
+    document.getElementById("recallPreset").addEventListener("click", () => {
+      const p = document.getElementById("presetRecall").value;
+      sendCommand(`*PS1,${p}`);
+    });
+
+    document.getElementById("storePreset").addEventListener("click", () => {
+      const p = document.getElementById("presetStore").value;
+      const ch = document.getElementById("storeChannel").value.padStart(3, '0');
+      sendCommand(`*PS1,${p},${ch}`);
+    });
+
+    function log(text) {
+      const out = document.getElementById("output");
+      out.textContent += text + "\n";
+      out.scrollTop = out.scrollHeight;
+    }
+  </script>
+</body>
+</html>
